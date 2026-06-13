@@ -10,29 +10,94 @@ import demesdraw
 from scipy.optimize import minimize
 
 eps = 1e-8
-from config import RELATE_PATH
+from config import RELATE_PATH #TODO: придумать как красиво ее задавать глобально
+
+
+def to_nodes(samples):
+    nodes = np.empty(2 * len(samples))
+    nodes[0::2] = 2 * samples
+    nodes[1::2] = 2 * samples + 1
+    return nodes
+
+## TODO: check if inequal samples counts work (may be difficulties with np.array)
+## TODO: check if TS_tsinfer/TS_relate may be defined with no TS_sim template 
+##          (create TS_model template just with samples indices, 
+##           then initialize TS_tsinfer/TS_relate with the tampolate and existing paths)
 
 class TS_model():
-    def __init__(self, N_samples, train_samples, ref_samples, targ_samples, true_ancestry, seq_len, ts=None):
-        #по-хорошему добавить проверку что данные согласованны + кикать популяции в которых никто не сидит
+    def __init__(self, anc_samples: np.ndarray | list, targ_samples: np.ndarray | list, 
+                 ts: tskit.TreeSequence | None=None, 
+                 train_ratio: float=0.4, true_ancestry: np.ndarray | list | None=None):
+
+        anc_samples = np.array(anc_samples, dtype=object)
+        targ_samples = np.array(targ_samples)
+
+        N_samples = np.array([len(i) for i in anc_samples] + [len(targ_samples)])
+
         ids = []
+        if N_samples[-1] <= 0:
+            raise ValueError('new population needs to contain at least one sample')
+        
         for i in range(len(N_samples) - 1):
+            if N_samples[i] < 0:
+                raise ValueError('populations cannot contain negative samples amount')
             if N_samples[i] > 0:
                 ids.append(i)
+        if len(ids) == 0:
+            raise ValueError('at least one of the ancestral populations needs to contain samples')
         ids.append(len(N_samples) - 1)
-        self.ids = ids[:-1]
-        self.ts = ts #tree sequence
+
+        self.ids = ids[:-1] #indices of non empty populations
         self.N_samples = N_samples[ids] #array with numbers of samples for each population, the last element refers to the new population
         self.anc_pops = len(self.N_samples) - 1 #number of ancestry populations
         self.N_anc = self.N_samples[:-1] #numbers of samples in each of ancestral populations
         self.N_targ = self.N_samples[-1] #number of samples in the new population
-        self.train_samples = train_samples[self.ids]
-        self.ref_samples = ref_samples[self.ids]
+
+        #NOTE: each sample refers to the whole individual
+        #       sample with id i has [2*i, 2*i+1] haplotype (node) ids 
+        self.anc_samples = anc_samples[self.ids]
+        
         self.targ_samples = targ_samples
-        self.true_ancestry = true_ancestry[:, self.ids] #true ancestry for samples from the new population
-        self.seq_len = seq_len
+        self.targ_nodes = to_nodes(targ_samples)
+
+        if train_ratio < 0 or train_ratio > 1:
+            raise ValueError('incorrect ratio value')
+        
+        train_samples = []
+        ref_samples = []
+        train_nodes = []
+        ref_nodes = []
+        anc_nodes = []
+        for i in range(self.anc_pops):
+            n = self.N_anc[i]
+            n_train = int(n * train_ratio)
+            anc = self.anc_samples[i]
+            train = np.random.choice(anc, size=n_train, replace=False)
+            ref = np.setdiff1d(anc, train)
+            train_samples.append(train)
+            ref_samples.append(ref)
+            train_nodes.append(to_nodes(train))
+            ref_nodes.append(to_nodes(ref))
+            anc_nodes.append(to_nodes(anc))
+
+        self.train_samples = np.array(train_samples, dtype=object)
+        self.ref_samples = np.array(ref_samples, dtype=object)
+        self.train_nodes = np.array(train_nodes, dtype=object)
+        self.ref_nodes = np.array(ref_nodes, dtype=object)
+        self.anc_nodes = np.array(anc_nodes, dtype=object)
+
+        if true_ancestry is not None:
+            self.true_ancestry = true_ancestry[:, self.ids] #true ancestry for samples from the new population
+
+        if ts is not None:
+            self.ts = ts #tree sequence
+            self.seq_len = ts.sequence_length #genome sequence length
 
     def save_vcf(self):
+
+        if not hasattr(self, "ts") or self.ts is None:
+            raise ValueError("tree sequence is not defined")
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.run_dir = f"results/run_{timestamp}"
         Path(self.run_dir).mkdir(parents=True, exist_ok=False)
@@ -78,17 +143,24 @@ class TS_model():
         return self.run_dir  
 
     def anc_cnt(self):
+        if not hasattr(self, "ts") or self.ts is None:
+            raise ValueError("tree sequence is not defined")
+        
+        node_pop = {}
+        for i in range(self.anc_pops):
+            for node in self.anc_nodes[i]:
+                node_pop[node] = i
+        for node in self.targ_nodes:
+            node_pop[node] = -1
 
         def count_leaf_population(node, tree):
             if node in leaf_population:
                 return leaf_population[node]
             cur_pop = np.zeros((self.anc_pops))
-            for i in range(self.anc_pops):
-                if node < 2 * np.sum(self.N_samples[:i+1]):
-                    cur_pop[i] = 1
-                    leaf_population[node] = cur_pop
-                    return cur_pop
-            if node < 2 * np.sum(self.N_samples):
+            if node in node_pop:
+                if node_pop[node] > -1:
+                    cur_pop[node_pop[node]] = 1 
+
                 leaf_population[node] = cur_pop
                 return cur_pop
             
@@ -119,21 +191,20 @@ class TS_model():
             
             for i in range(self.anc_pops):
                 span_rel_rel = span_rel / (2 * self.N_anc[i])
-                for sample in self.train_samples[i]:
-                    cur_tree_ancestry = count_cousins(sample, tree)
+                for node in self.train_nodes[i]:
+                    cur_tree_ancestry = count_cousins(node, tree)
                     for j in range(self.anc_pops):
                         self.ancestry_train[i,j,int(cur_tree_ancestry[j])] += span_rel_rel
             
             for i in range(2 * self.N_targ):
-                sample = self.targ_samples[i]
-                cur_tree_ancestry = count_cousins(sample, tree)
+                node = self.targ_nodes[i]
+                cur_tree_ancestry = count_cousins(node, tree)
                 for j in range(self.anc_pops):
                     self.ancestry_targ[i,j,int(cur_tree_ancestry[j])] += span_rel
 
-        return
-        
+        return   
 
-    def appr(self, sample_idx, distance_type='L2', allow_unknown_ancestry=False):
+    def appr(self, node_idx: int, distance_type: str='KL', allow_unknown_ancestry: bool=False):
 
         def distance(a, b):
             if distance_type == 'L2':
@@ -152,9 +223,12 @@ class TS_model():
                     self.ancestry_train[:, j, :],
                     axes=1
                 )
-                err += distance(self.ancestry_targ[sample_idx, j], dist)
+                err += distance(self.ancestry_targ[node_idx, j], dist)
             
             return err
+        
+        if not (hasattr(self, "ancestry_targ") and hasattr(self, "ancestry_train")) or self.ancestry_targ is None or self.ancestry_train is None:
+            raise ValueError("ancestry is not defined yet, first use anc_cnt() function")
 
         if allow_unknown_ancestry:
             constraints = [{"type": "ineq", "fun": lambda x: 1 - np.sum(x)}]
@@ -174,19 +248,18 @@ class TS_model():
         
         alpha = alpha_res.x
         return alpha, dist_err(alpha)
-    
-    
-    def targ_appr(self, distance_type='KL', allow_unknown_ancestry=False):
+        
+    def targ_appr(self, distance_type: str='KL', allow_unknown_ancestry: bool=False):
         alpha = []
         d_err = []
-        for sample_idx in range(2 * self.N_targ):
-            a, e = self.appr(sample_idx, distance_type=distance_type, allow_unknown_ancestry=allow_unknown_ancestry)
+        for node_idx in range(2 * self.N_targ):
+            a, e = self.appr(node_idx, distance_type=distance_type, allow_unknown_ancestry=allow_unknown_ancestry)
             alpha.append(a)
             d_err.append(e)
 
         return np.array(alpha), np.array(d_err)
     
-    def targ_appr_res(self, pop_id=0, distance_type='KL', allow_unknown_ancestry=False):
+    def targ_appr_res(self, pop_id:int=0, distance_type: str='KL', allow_unknown_ancestry: bool=False):
         alpha, _ = self.targ_appr(distance_type=distance_type, allow_unknown_ancestry=allow_unknown_ancestry)
         t_a = self.true_ancestry[:,pop_id]
         a_a = alpha[:,pop_id]
@@ -208,9 +281,10 @@ class TS_model():
 class TS_sim(TS_model):
     def __init__(self, 
                 t_anc: float=500, t_new: float=5, 
-                admix_ratio=None, rho=1.2e-8, mu=1.25e-8, train_ratio=0.4,
-                anc_pops = None, N_samples=None,
-                size_com: int=1e3, size_anc=None, size_new: int=1e3, seq_len=None):
+                admix_ratio: None|np.ndarray|list=None, rho=1.2e-8, mu=1.25e-8,
+                anc_pops: None|int=None, N_samples: None|np.ndarray|list=None,
+                size_com: int=1e3, size_anc: None|np.ndarray|list=None, size_new: int=1e3, 
+                seq_len: int|None=None, train_ratio: float=0.4):
 
         if N_samples is None:
             if anc_pops is None:
@@ -232,13 +306,13 @@ class TS_sim(TS_model):
             seq_len = int(1 / rho)
         
         self.dem_sim(t_anc, t_new, admix_ratio, size_com, size_anc, size_new)
-        ts, train_samples, ref_samples, targ_samples = self.anc_sim(N_samples, rho, mu, train_ratio, seq_len)
+        ts, anc_samples, targ_samples = self.anc_sim(N_samples, rho, mu, seq_len)
         true_ancestry = self.true_anc()
 
-        super().__init__(N_samples, train_samples, ref_samples, targ_samples, true_ancestry, seq_len, ts)
+        super().__init__(anc_samples, targ_samples, ts, train_ratio, true_ancestry)
 
-    def dem_sim(self, t_anc: float=500, t_new: float=5, admix_ratio=None, 
-                size_com: int=1e3, size_anc=None, size_new: int=1e3):
+    def dem_sim(self, t_anc: float, t_new: float, admix_ratio: np.ndarray | list, 
+                size_com: int, size_anc: np.ndarray | list, size_new: int):
 
         if size_anc is None:
             size_anc = [size_new] * self.anc_pops
@@ -261,7 +335,7 @@ class TS_sim(TS_model):
         demesdraw.tubes(pic)
         return
     
-    def anc_sim(self, N_samples=None, rho = 1.2e-8, mu = 1.25e-8, train_ratio = 0.4, seq_len=None):
+    def anc_sim(self, N_samples: np.ndarray | list, rho: float, mu: float, seq_len: int):
         if seq_len is None:
             seq_len = int(1 / rho)
         self.seq_len = seq_len
@@ -274,25 +348,17 @@ class TS_sim(TS_model):
         ts = msprime.sim_ancestry(samples=samples, demography=self.demo, sequence_length=seq_len, recombination_rate=rho, ploidy=2)
         ts = msprime.sim_mutations(tree_sequence=ts, rate=mu)
         self.ts = ts
-        
-        train_samples = []
-        ref_samples = []
-        for i in range(len(N_samples) - 1):
-            n = N_samples[i]
-            n_train = int(n * train_ratio)
-            train = np.random.choice(np.arange(np.sum(N_samples[:i]), np.sum(N_samples[:i+1])), size=n_train, replace=False)
-            train = np.concatenate((2 * train, 2 * train + 1))
-            ref = np.setdiff1d(np.arange(2 * np.sum(N_samples[:i]), 2 * np.sum(N_samples[:i+1])), train)
-            train_samples.append(train)
-            ref_samples.append(ref)
 
-        train_samples = np.array(train_samples)
-        ref_samples = np.array(ref_samples)
-        targ_samples = np.arange(2 * np.sum(N_samples[:-1]), 2 * np.sum(N_samples))
-        self.train_samples = train_samples
-        self.ref_samples = ref_samples
+        anc_samples = []
+        for i in range(len(N_samples) - 1):
+            anc_samples.append(np.arange(np.sum(N_samples[:i]), np.sum(N_samples[:i+1])))
+        anc_samples = np.array(anc_samples, dtype=object)
+        
+        targ_samples = np.arange(np.sum(N_samples[:-1]), np.sum(N_samples))
+
+        self.anc_samples = anc_samples
         self.targ_samples = targ_samples
-        return ts, train_samples, ref_samples, targ_samples
+        return ts, anc_samples, targ_samples
 
     def true_anc(self):
 
@@ -307,16 +373,20 @@ class TS_sim(TS_model):
         true_ancestry = np.zeros((2 * self.N_samples[-1], self.anc_pops))
         for tree in self.ts.trees():
             span_rel = tree.span / self.seq_len
-            for i in range(2 * self.N_samples[-1]):
-                node = self.targ_samples[i]
-                pop = count_local_ancestry(node, tree)
-                if pop != 'com':
-                    true_ancestry[i,pop] += span_rel
+            for i in range(self.N_samples[-1]):
+                sample = self.targ_samples[i]
+                for h in range(2):
+                    node = 2 * sample + h
+                    pop = count_local_ancestry(node, tree)
+                    if pop != 'com':
+                        true_ancestry[2 * i + h, pop] += span_rel
         self.true_ancestry = true_ancestry
         return true_ancestry
 
 class TS_tsinfer(TS_model):
-    def __init__(self, ts_sim:TS_model, run_dir, vcf_path=None, ancestral_states_path=None):
+    def __init__(self, ts_sim:TS_model, run_dir: str, 
+                 vcf_path:str|None=None, ancestral_states_path:str|None=None, 
+                 train_ratio: float=0.4):
 
         if vcf_path is None:
             vcf_path = run_dir + "/sim.vcf.gz"
@@ -332,11 +402,14 @@ class TS_tsinfer(TS_model):
         vdata = tsinfer.VariantData(zarr_path, ancestral_states)
         ts = tsinfer.infer(vdata, progress_monitor=False)
 
-        super().__init__(ts_sim.N_samples, ts_sim.train_samples, ts_sim.ref_samples, ts_sim.targ_samples, 
-                         ts_sim.true_ancestry, ts_sim.seq_len, ts)
+        super().__init__(ts_sim.anc_samples, ts_sim.targ_samples, 
+                         ts, train_ratio)
+        self.true_ancestry = ts_sim.true_ancestry
 
 class TS_relate(TS_model):
-    def __init__(self, ts_sim:TS_model, run_dir, haps_path=None, sample_path=None, map_path=None):
+    def __init__(self, ts_sim:TS_model, run_dir: str, 
+                 haps_path: str|None=None, sample_path: str|None=None, map_path: str|None=None,
+                 train_ratio: float=0.4):
         if haps_path is None:
             haps_path = "sim.haps"
         if sample_path is None:
@@ -364,6 +437,7 @@ class TS_relate(TS_model):
 
         ts = tskit.load(run_dir + "/relate_arg.trees")
 
-        super().__init__(ts_sim.N_samples, ts_sim.train_samples, ts_sim.ref_samples, ts_sim.targ_samples, 
-                         ts_sim.true_ancestry, ts_sim.seq_len, ts)
+        super().__init__(ts_sim.anc_samples, ts_sim.targ_samples, 
+                         ts, train_ratio)
+        self.true_ancestry = ts_sim.true_ancestry
         
