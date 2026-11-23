@@ -1,28 +1,26 @@
 import msprime, tsinfer, tskit
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+#import matplotlib.pyplot as plt
+#from matplotlib.colors import LogNorm
 import numpy as np
 from datetime import datetime
+import os
 import subprocess
 from Bio import bgzf
 from pathlib import Path
-import demesdraw
+#import demesdraw
 from scipy.optimize import minimize
 
 eps = 1e-8
-from config import RELATE_PATH #TODO: придумать как красиво ее задавать глобально
+RELATE_PATH = os.getcwd()+ "/relate/bin"
+## NOTE:    (now it only works if relate folder is renamed to 'relate')
 
 
 def to_nodes(samples):
-    nodes = np.empty(2 * len(samples))
+    nodes = np.empty(2 * len(samples), dtype=np.int64)
     nodes[0::2] = 2 * samples
     nodes[1::2] = 2 * samples + 1
     return nodes
 
-## TODO: check if inequal samples counts work (may be difficulties with np.array)
-## TODO: check if TS_tsinfer/TS_relate may be defined with no TS_sim template 
-##          (create TS_model template just with samples indices, 
-##           then initialize TS_tsinfer/TS_relate with the tampolate and existing paths)
 
 class TS_model():
     def __init__(self, anc_samples: np.ndarray | list, targ_samples: np.ndarray | list, 
@@ -93,6 +91,9 @@ class TS_model():
             self.ts = ts #tree sequence
             self.seq_len = ts.sequence_length #genome sequence length
 
+        if not hasattr(self, "mu"):
+            self.mu = 1.25e-8
+
     def save_vcf(self):
 
         if not hasattr(self, "ts") or self.ts is None:
@@ -137,8 +138,8 @@ class TS_model():
             pos = self.ts.sites_position
             rdist = pos/self.seq_len * 100
             for i in range(pos.shape[0] - 1):
-                mapfile.write(f'{pos[i]} {(rdist[i+1] - rdist[i])/(pos[i+1] - pos[i]) * 1e6} {rdist[i]}\n')
-            mapfile.write(f'{pos[-1]} {(rdist[-1] - 100)/(pos[-1] - self.seq_len) * 1e6} {rdist[-1]}\n')
+                mapfile.write(f'{pos[i]} {(rdist[i+1] - rdist[i])/(pos[i+1] - pos[i]) * eps} {rdist[i]}\n')
+            mapfile.write(f'{pos[-1]} {(rdist[-1] - 100)/(pos[-1] - self.seq_len) * eps} {rdist[-1]}\n')
 
         return self.run_dir  
 
@@ -259,23 +260,23 @@ class TS_model():
 
         return np.array(alpha), np.array(d_err)
     
-    def targ_appr_res(self, pop_id:int=0, distance_type: str='KL', allow_unknown_ancestry: bool=False):
-        alpha, _ = self.targ_appr(distance_type=distance_type, allow_unknown_ancestry=allow_unknown_ancestry)
-        t_a = self.true_ancestry[:,pop_id]
-        a_a = alpha[:,pop_id]
-        _, ax = plt.subplots(1, 2, figsize=(10, 4))
-        ax[0].set_xlabel('actual proportion')
-        ax[0].set_ylabel('proportion approximation')
-        ax[0].plot([0,1], [0,1], alpha=0.3)
-        ax[0].scatter(t_a, a_a)
-        ax[0].set_title(f'proportion of ancestry from the population number {self.ids[pop_id] + 1}\n' + 
-                        f'MSE = {np.mean((t_a - a_a)**2)}\n' +
-                        f'approximation with {distance_type} type of distribution distance')
+    # def targ_appr_res(self, pop_id:int=0, distance_type: str='KL', allow_unknown_ancestry: bool=False):
+    #     alpha, _ = self.targ_appr(distance_type=distance_type, allow_unknown_ancestry=allow_unknown_ancestry)
+    #     t_a = self.true_ancestry[:,pop_id]
+    #     a_a = alpha[:,pop_id]
+    #     _, ax = plt.subplots(1, 2, figsize=(10, 4))
+    #     ax[0].set_xlabel('actual proportion')
+    #     ax[0].set_ylabel('proportion approximation')
+    #     ax[0].plot([0,1], [0,1], alpha=0.3)
+    #     ax[0].scatter(t_a, a_a)
+    #     ax[0].set_title(f'proportion of ancestry from the population number {self.ids[pop_id] + 1}\n' + 
+    #                     f'MSE = {np.mean((t_a - a_a)**2)}\n' +
+    #                     f'approximation with {distance_type} type of distribution distance')
         
-        ax[1].boxplot(a_a - t_a)
-        ax[1].axhline(y=0, color='grey', alpha=0.5) 
-        plt.show()
-        return
+    #     ax[1].boxplot(a_a - t_a)
+    #     ax[1].axhline(y=0, color='grey', alpha=0.5) 
+    #     plt.show()
+    #     return
 
 
 class TS_sim(TS_model):
@@ -295,15 +296,18 @@ class TS_sim(TS_model):
         self.anc_pops = anc_pops
 
         self.mu = mu
-        self.N = np.sum(N_samples)
         self.N_samples = N_samples
 
         if size_anc is None:
             size_anc = np.array([1e3] * anc_pops)
         if admix_ratio is None:
-            admix_ratio = np.array([1 / anc_pops] * anc_pops)
+            admix_ratio = [1 / anc_pops] * anc_pops
+        admix_ratio = np.array(admix_ratio)
         if seq_len is None:
             seq_len = int(1 / rho)
+
+        if np.sum(admix_ratio) > 1:
+            raise ValueError('sum of admixture ratios is higher than 1')
         
         self.dem_sim(t_anc, t_new, admix_ratio, size_com, size_anc, size_new)
         ts, anc_samples, targ_samples = self.anc_sim(N_samples, rho, mu, seq_len)
@@ -330,10 +334,10 @@ class TS_sim(TS_model):
         self.demo = demography
         return demography
     
-    def dem_pic(self):
-        pic = msprime.Demography.to_demes(self.demo)
-        demesdraw.tubes(pic)
-        return
+    # def dem_pic(self):
+    #     pic = msprime.Demography.to_demes(self.demo)
+    #     demesdraw.tubes(pic)
+    #     return
     
     def anc_sim(self, N_samples: np.ndarray | list, rho: float, mu: float, seq_len: int):
         if seq_len is None:
@@ -349,9 +353,12 @@ class TS_sim(TS_model):
         ts = msprime.sim_mutations(tree_sequence=ts, rate=mu)
         self.ts = ts
 
+        N_samples = np.asarray(N_samples, dtype=np.int64) 
         anc_samples = []
         for i in range(len(N_samples) - 1):
-            anc_samples.append(np.arange(np.sum(N_samples[:i]), np.sum(N_samples[:i+1])))
+            start = int(np.sum(N_samples[:i]))
+            stop = int(np.sum(N_samples[:i+1]))
+            anc_samples.append(np.arange(start, stop, dtype=np.int64))
         anc_samples = np.array(anc_samples, dtype=object)
         
         targ_samples = np.arange(np.sum(N_samples[:-1]), np.sum(N_samples))
@@ -404,7 +411,8 @@ class TS_tsinfer(TS_model):
 
         super().__init__(ts_sim.anc_samples, ts_sim.targ_samples, 
                          ts, train_ratio)
-        self.true_ancestry = ts_sim.true_ancestry
+        if hasattr(ts_sim, "true_ancestry"):
+            self.true_ancestry = ts_sim.true_ancestry
 
 class TS_relate(TS_model):
     def __init__(self, ts_sim:TS_model, run_dir: str, 
@@ -424,7 +432,7 @@ class TS_relate(TS_model):
             "--sample", sample_path,
             "--map", map_path,
             "-m", str(ts_sim.mu),
-            "-N", str(ts_sim.N), 
+            "-N", str(2* np.sum(ts_sim.N_samples)), 
             "--output", "relate_arg"
         ], check=True, cwd=run_dir)
 
@@ -439,5 +447,6 @@ class TS_relate(TS_model):
 
         super().__init__(ts_sim.anc_samples, ts_sim.targ_samples, 
                          ts, train_ratio)
-        self.true_ancestry = ts_sim.true_ancestry
+        if hasattr(ts_sim, "true_ancestry"):
+            self.true_ancestry = ts_sim.true_ancestry
         
